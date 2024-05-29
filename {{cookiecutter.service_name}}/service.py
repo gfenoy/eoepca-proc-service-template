@@ -104,6 +104,7 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
         else:
             self.use_workspace = False
 
+        self.username = None
         auth_env = self.conf.get("auth_env", {})
         self.ades_rx_token = auth_env.get("jwt", "")
 
