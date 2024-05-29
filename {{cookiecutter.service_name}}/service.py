@@ -120,10 +120,25 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
             # logger.info(f"zzz PRE-HOOK - config...\n{json.dumps(self.conf, indent=2)}\n")
             
             # decode the JWT token to get the user name
+            username_source = None
             if self.ades_rx_token:
                 self.username = self.get_user_name(
                     jwt.decode(self.ades_rx_token, options={"verify_signature": False})
                 )
+                if self.username:
+                    username_source = "JWT"
+
+            # Else get username from Path-Prefix - already parsed into env var
+            if not self.username:
+                self.username = os.getenv("SERVICES_NAMESPACE")
+                if self.username:
+                    username_source = "Path-Prefix"
+
+            # Log username outcome
+            if self.username:
+                logger.info("Using username {self.username} from {username_source}")
+            else:
+                logger.warning("Unable to determine username")
 
             if self.use_workspace:
                 logger.info("Lookup storage details in Workspace")
@@ -137,8 +152,9 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
                 # Request: Get Workspace Details
                 headers = {
                     "accept": "application/json",
-                    "Authorization": f"Bearer {self.ades_rx_token}",
                 }
+                if self.ades_rx_token:
+                    headers["Authorization"] = f"Bearer {self.ades_rx_token}"
                 get_workspace_details_response = requests.get(workspace_api_endpoint, headers=headers)
 
                 # GOOD response from Workspace API - use the details
@@ -244,8 +260,9 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
                 logger.info(f"Register collection in workspace {self.workspace_prefix}-{self.username}")
                 headers = {
                     "Accept": "application/json",
-                    "Authorization": f"Bearer {self.ades_rx_token}",
                 }
+                if self.ades_rx_token:
+                    headers["Authorization"] = f"Bearer {self.ades_rx_token}"
                 api_endpoint = f"{self.workspace_url}/workspaces/{self.workspace_prefix}-{self.username}"
                 r = requests.post(
                     f"{api_endpoint}/register-json",
@@ -302,11 +319,11 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
         # logger.info(f"init_config_defaults: additional_parameters...\n{json.dumps(conf['additional_parameters'], indent=2)}\n")
 
     @staticmethod
-    def get_user_name(decodedJwt) -> str:
+    def get_user_name(decodedJwt) -> str | None:
         for key in ["username", "user_name", "preferred_username"]:
             if key in decodedJwt:
                 return decodedJwt[key]
-        return ""
+        return None
 
     @staticmethod
     def local_get_file(fileName):
