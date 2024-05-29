@@ -137,7 +137,7 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
 
             # Log username outcome
             if self.username:
-                logger.info("Using username {self.username} from {username_source}")
+                logger.info(f"Using username {self.username} from {username_source}")
             else:
                 logger.warning("Unable to determine username")
 
