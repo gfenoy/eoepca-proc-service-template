@@ -320,7 +320,7 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
         # logger.info(f"init_config_defaults: additional_parameters...\n{json.dumps(conf['additional_parameters'], indent=2)}\n")
 
     @staticmethod
-    def get_user_name(decodedJwt) -> str | None:
+    def get_user_name(decodedJwt):
         for key in ["username", "user_name", "preferred_username"]:
             if key in decodedJwt:
                 return decodedJwt[key]
