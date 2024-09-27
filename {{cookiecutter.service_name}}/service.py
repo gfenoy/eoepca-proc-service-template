@@ -457,6 +457,12 @@ def {{cookiecutter.workflow_id |replace("-", "_")  }}(conf, inputs, outputs): # 
 
     except Exception as e:
         logger.error("ERROR in processing execution template...")
+        logger.error("Try fetching logs if any...")
+        try:
+            tool_logs = runner.execution.get_tool_logs()
+            execution_handler.handle_outputs(None, None, None, tool_logs)
+        except Exception as e:
+            logger.error("Fethcing logs failed!"+str(e))
         stack = traceback.format_exc()
         logger.error(stack)
         conf["lenv"]["message"] = zoo._(f"Exception during execution...\n{stack}\n")
