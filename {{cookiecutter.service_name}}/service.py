@@ -381,6 +381,7 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
             logger.info("handle_outputs")
 
             # link element to add to the statusInfo
+            self.conf['main']['tmpUrl']=self.conf['main']['tmpUrl'].replace("/temps",self.conf["auth_env"]["user"]+"/temp")
             servicesLogs = [
                 {
                     "url": os.path.join(self.conf['main']['tmpUrl'],
