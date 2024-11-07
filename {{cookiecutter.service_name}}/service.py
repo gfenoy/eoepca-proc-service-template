@@ -392,17 +392,20 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
                 }
                 for tool_log in tool_logs
             ]
+            cindex=0
+            if "service_logs" in self.conf:
+                cindex=1
             for i in range(len(servicesLogs)):
                 okeys = ["url", "title", "rel"]
                 keys = ["url", "title", "rel"]
-                if i > 0:
+                if cindex > 0:
                     for j in range(len(keys)):
-                        keys[j] = keys[j] + "_" + str(i)
+                        keys[j] = keys[j] + "_" + str(cindex)
                 if "service_logs" not in self.conf:
                     self.conf["service_logs"] = {}
                 for j in range(len(keys)):
                     self.conf["service_logs"][keys[j]] = servicesLogs[i][okeys[j]]
-
+                cindex += 1
             self.conf["service_logs"]["length"] = str(len(servicesLogs))
 
         except Exception as e:
@@ -458,7 +461,24 @@ def {{cookiecutter.workflow_id |replace("-", "_")  }}(conf, inputs, outputs): # 
 
     except Exception as e:
         logger.error("ERROR in processing execution template...")
-        logger.error("Try fetching logs if any...")
+        try:
+            with open(os.path.join(conf["main"]["tmpPath"], runner.get_namespace_name(),"job.log"),"w",encoding="utf-8") as file:
+                file.write(runner.execution.get_log())
+            if "service_logs" not in conf:
+                conf["service_logs"] = {}
+            keys=["url","title","rel"]
+            if "length" in conf["service_logs"]:
+                for i in range(len(keys)):
+                    keys[i]+="_"+str(int(conf["service_logs"]["length"]))
+            conf["service_logs"][keys[0]]=os.path.join(conf['main']['tmpUrl'].replace("temp/",conf["auth_env"]["user"]+"/temp/"),
+                    runner.get_namespace_name(),
+                    "job.log")
+            conf["service_logs"][keys[1]]="Job pod log"
+            conf["service_logs"][keys[2]]="related"
+            conf["service_logs"]["length"]="1"
+            logger.info("Job log saved")
+        except Exception as e:
+            logger.error(f"{str(e)}")
         try:
             tool_logs = runner.execution.get_tool_logs()
             execution_handler.handle_outputs(None, None, None, tool_logs)
