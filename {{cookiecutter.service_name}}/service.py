@@ -99,10 +99,17 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
         self.domain = eoepca.get("domain", "")
         self.workspace_url = eoepca.get("workspace_url", "")
         self.workspace_prefix = eoepca.get("workspace_prefix", "")
+
+        # Should the user's Workspace bucket be used for stage-out?
+        # Only if both the workspace url, and the workspace prefix have been specified.
         if self.workspace_url and self.workspace_prefix:
             self.use_workspace = True
         else:
             self.use_workspace = False
+
+        # Should outputs be registered to the Workspace Catalogue?
+        # Only if we are using the Workspace, and catalogue registration has been specified.
+        self.workspace_catalog_register = self.use_workspace and ((eoepca.get("workspace_catalog_register", "false")).lower() == "true")
 
         self.username = None
         auth_env = self.conf.get("auth_env", {})
@@ -256,8 +263,8 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
             # Set the feature collection to be returned
             self.feature_collection = json.dumps(collection_dict, indent=2)
 
-            # Register with the workspace
-            if self.use_workspace:
+            # Register with the workspace catalogue
+            if self.workspace_catalog_register:
                 logger.info(f"Register collection in workspace {self.workspace_prefix}-{self.username}")
                 headers = {
                     "Accept": "application/json",
