@@ -1,4 +1,6 @@
 # see https://zoo-project.github.io/workshops/2014/first_service.html#f1
+from __future__ import annotations
+from typing import Dict
 import pathlib
 
 try:
@@ -30,7 +32,7 @@ import requests
 import yaml
 from botocore.exceptions import ClientError
 from loguru import logger
-from pystac import read_file
+from pystac import read_file, Collection, Catalog
 from pystac.stac_io import DefaultStacIO, StacIO
 from zoo_calrissian_runner import ExecutionHandler, ZooCalrissianRunner
 from botocore.client import Config
@@ -89,9 +91,10 @@ StacIO.set_default(CustomStacIO)
 
 
 class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
-    def __init__(self, conf):
+    def __init__(self, conf, outputs):
         super().__init__()
         self.conf = conf
+        self.outputs = outputs
 
         self.http_proxy_env = os.environ.get("HTTP_PROXY", None)
 
@@ -200,6 +203,7 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
         finally:
             self.restore_http_proxy_env()
 
+
     def post_execution_hook(self, log, output, usage_report, tool_logs):
         try:
             logger.info("Post execution hook")
@@ -215,23 +219,55 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
             os.environ["AWS_REGION"] = self.conf["additional_parameters"]["STAGEOUT_AWS_REGION"]
 
             StacIO.set_default(CustomStacIO)
+            for i in self.outputs:
+                logger.info(f"Output {i}: {self.outputs[i]}")
+                if "mimeType" in self.outputs[i]:
+                    self.setOutput(i,output)
+                else:
+                    logger.warning(f"Output {i} has no mimeType, skipping...")
+                    self.outputs[i]["value"] = str(output[i])
 
-            logger.info(f"Read catalog => STAC Catalog URI: {output['StacCatalogUri']}")
+        except Exception as e:
+            logger.error("ERROR in post_execution_hook...")
+            logger.error(traceback.format_exc())
+            raise(e)
+
+        finally:
+            self.restore_http_proxy_env()
+
+    def setOutput(self, outputName, values):
+        output=self.outputs[outputName]
+        logger.info(f"Read catalog from STAC Catalog URI: {output} -> {values}")
+        #logger.info(f"Read catalog => STAC Catalog URI: {output['StacCatalogUri']}")
+        if not(isinstance(values[outputName], list)):
+            logger.info(f"values[{outputName}] is not a list, tranform to an array")
+            values[outputName]=[values[outputName]]
+
+        items = []
+
+        for i in range(len(values[outputName])):
+            if values[outputName][i] is None:
+                break
+            s3_path = values[outputName][i]["value"]
             try:
-                s3_path = output["StacCatalogUri"]
                 if s3_path.count("s3://")==0:
                     s3_path = "s3://" + s3_path
-                cat = read_file( s3_path )
+                cat: Catalog  = read_file(s3_path)
             except Exception as e:
-                logger.error(f"Exception: {e}")
+                logger.error(f"No collection found in the output catalog {e}")
+                output["collection"] = json.dumps({}, indent=2)
+                return
 
-            collection_id = self.conf["additional_parameters"]["collection_id"]
+            collection_id = collection_id = self.conf["additional_parameters"]["collection_id"]
+
             logger.info(f"Create collection with ID {collection_id}")
+
             collection = None
+
             try:
-                collection = next(cat.get_all_collections())
-                logger.info("Got collection from outputs")
-            except:
+                logger.info(f"Catalog : {dir(cat)}")
+                collection: Collection = next(cat.get_all_collections())
+            except Exception as e:
                 try:
                     items=cat.get_all_items()
                     itemFinal=[]
@@ -246,57 +282,51 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
                             i.assets[a]=i.assets[a].from_dict(cDict)
                         i.collection_id=collection_id
                         itemFinal+=[i.clone()]
+                        items.append(i.clone())
                     collection = ItemCollection(items=itemFinal)
                     logger.info("Created collection from items")
                 except Exception as e:
-                    logger.error(f"Exception: {e}"+str(e))
+                    logger.error(f"No collection or item found in the output catalog {e}")
             
-            # Trap the case of no output collection
-            if collection is None:
-                logger.error("ABORT: The output collection is empty")
-                self.feature_collection = json.dumps({}, indent=2)
-                return
+        # Trap the case of no output collection
+        if collection is None:
+            logger.error("ABORT: The output collection is empty")
+            output["collection"] = json.dumps({}, indent=2)
+            return
 
-            collection_dict=collection.to_dict()
-            collection_dict["id"]=collection_id
+        if len(items)>0:
+            collection = ItemCollection(items=itemFinal)
+        collection_dict=collection.to_dict()
+        collection_dict["id"]=collection_id
+        output["collection"] = collection_dict
+        output["collection"]["id"] = collection_id
 
-            # Set the feature collection to be returned
-            self.feature_collection = json.dumps(collection_dict, indent=2)
+        # Register with the workspace catalogue
+        if self.workspace_catalog_register:
+            logger.info(f"Register collection in workspace {self.workspace_prefix}-{self.username}")
+            headers = {
+                "Accept": "application/json",
+            }
+            if self.ades_rx_token:
+                headers["Authorization"] = f"Bearer {self.ades_rx_token}"
+            api_endpoint = f"{self.workspace_url}/workspaces/{self.workspace_prefix}-{self.username}"
+            r = requests.post(
+                f"{api_endpoint}/register-json",
+                json=collection_dict,
+                headers=headers,
+            )
+            logger.info(f"Register collection response: {r.status_code}")
 
-            # Register with the workspace catalogue
-            if self.workspace_catalog_register:
-                logger.info(f"Register collection in workspace {self.workspace_prefix}-{self.username}")
-                headers = {
-                    "Accept": "application/json",
-                }
-                if self.ades_rx_token:
-                    headers["Authorization"] = f"Bearer {self.ades_rx_token}"
-                api_endpoint = f"{self.workspace_url}/workspaces/{self.workspace_prefix}-{self.username}"
-                r = requests.post(
-                    f"{api_endpoint}/register-json",
-                    json=collection_dict,
-                    headers=headers,
-                )
-                logger.info(f"Register collection response: {r.status_code}")
-
-                # TODO pool the catalog until the collection is available
-                #self.feature_collection = requests.get(
-                #    f"{api_endpoint}/collections/{collection.id}", headers=headers
-                #).json()
-            
-                logger.info(f"Register processing results to collection")
-                r = requests.post(f"{api_endpoint}/register",
-                                json={"type": "stac-item", "url": collection.get_self_href()},
-                                headers=headers,)
-                logger.info(f"Register processing results response: {r.status_code}")
-
-        except Exception as e:
-            logger.error("ERROR in post_execution_hook...")
-            logger.error(traceback.format_exc())
-            raise(e)
+            # TODO pool the catalog until the collection is available
+            #self.feature_collection = requests.get(
+            #    f"{api_endpoint}/collections/{collection.id}", headers=headers
+            #).json()
         
-        finally:
-            self.restore_http_proxy_env()
+            logger.info(f"Register processing results to collection")
+            r = requests.post(f"{api_endpoint}/register",
+                            json={"type": "stac-item", "url": collection.get_self_href()},
+                            headers=headers,)
+            logger.info(f"Register processing results response: {r.status_code}")
 
     def unset_http_proxy_env(self):
         http_proxy = os.environ.pop("HTTP_PROXY", None)
@@ -433,7 +463,7 @@ def {{cookiecutter.workflow_id |replace("-", "_")  }}(conf, inputs, outputs): # 
         ) as stream:
             cwl = yaml.safe_load(stream)
 
-        execution_handler = EoepcaCalrissianRunnerExecutionHandler(conf=conf)
+        execution_handler = EoepcaCalrissianRunnerExecutionHandler(conf=conf, outputs=outputs)
 
         runner = ZooCalrissianRunner(
             cwl=cwl,
@@ -459,7 +489,12 @@ def {{cookiecutter.workflow_id |replace("-", "_")  }}(conf, inputs, outputs): # 
 
         if exit_status == zoo.SERVICE_SUCCEEDED:
             logger.info(f"Setting Collection into output key {list(outputs.keys())[0]}")
-            outputs[list(outputs.keys())[0]]["value"] = execution_handler.feature_collection
+            for i in outputs:
+                logger.info(f"Setting Collection into output key {i}: {outputs[i]}")
+                if "collection" in outputs[i]:
+                    outputs[i]["value"] = json.dumps(
+                        outputs[i]["collection"], indent=2
+                    )
             return zoo.SERVICE_SUCCEEDED
 
         else:
