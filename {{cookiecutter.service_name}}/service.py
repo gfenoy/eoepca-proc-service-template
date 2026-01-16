@@ -418,7 +418,6 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
             logger.info("handle_outputs")
 
             # link element to add to the statusInfo
-            self.conf['main']['tmpUrl']=self.conf['main']['tmpUrl'].replace("temp/",self.conf["auth_env"]["user"]+"/temp/")
             servicesLogs = [
                 {
                     "url": os.path.join(self.conf['main']['tmpUrl'],
@@ -512,7 +511,7 @@ def {{cookiecutter.workflow_id |replace("-", "_")  }}(conf, inputs, outputs): # 
             if "length" in conf["service_logs"]:
                 for i in range(len(keys)):
                     keys[i]+="_"+str(int(conf["service_logs"]["length"]))
-            conf["service_logs"][keys[0]]=os.path.join(conf['main']['tmpUrl'].replace("temp/",conf["auth_env"]["user"]+"/temp/"),
+            conf["service_logs"][keys[0]]=os.path.join(conf['main']['tmpUrl'],
                     runner.get_namespace_name(),
                     "job.log")
             conf["service_logs"][keys[1]]="Job pod log"
