@@ -1,4 +1,6 @@
 # see https://zoo-project.github.io/workshops/2014/first_service.html#f1
+from __future__ import annotations
+from typing import Dict
 import pathlib
 
 try:
@@ -21,275 +23,363 @@ except ImportError:
 import json
 import os
 import sys
-from urllib.parse import urlparse
 
-import boto3  # noqa: F401
-import botocore
 import jwt
 import requests
 import yaml
-from botocore.exceptions import ClientError
 from loguru import logger
-from pystac import read_file
-from pystac.stac_io import DefaultStacIO, StacIO
-from zoo_calrissian_runner import ExecutionHandler, ZooCalrissianRunner
-from botocore.client import Config
+from pystac import Catalog, Collection, read_file
+from pystac.item_collection import ItemCollection
+from pystac.stac_io import StacIO
+from zoo_calrissian_runner import ZooCalrissianRunner
+from zoo_template_common import CommonExecutionHandler, CustomStacIO
 
+# For DEBUG
+import traceback
 
 logger.remove()
 logger.add(sys.stderr, level="INFO")
 
-
-class CustomStacIO(DefaultStacIO):
-    """Custom STAC IO class that uses boto3 to read from S3."""
-
-    def __init__(self):
-        self.session = botocore.session.Session()
-        self.s3_client = self.session.create_client(
-            service_name="s3",
-            region_name=os.environ.get("AWS_REGION"),
-            endpoint_url=os.environ.get("AWS_S3_ENDPOINT"),
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            verify=True,
-            use_ssl=True,
-            config=Config(s3={"addressing_style": "path", "signature_version": "s3v4"}),
-        )
-
-    def read_text(self, source, *args, **kwargs):
-        parsed = urlparse(source)
-        if parsed.scheme == "s3":
-            return (
-                self.s3_client.get_object(Bucket=parsed.netloc, Key=parsed.path[1:])[
-                    "Body"
-                ]
-                .read()
-                .decode("utf-8")
-            )
-        else:
-            return super().read_text(source, *args, **kwargs)
-
-    def write_text(self, dest, txt, *args, **kwargs):
-        parsed = urlparse(dest)
-        if parsed.scheme == "s3":
-            self.s3_client.put_object(
-                Body=txt.encode("UTF-8"),
-                Bucket=parsed.netloc,
-                Key=parsed.path[1:],
-                ContentType="application/geo+json",
-            )
-        else:
-            super().write_text(dest, txt, *args, **kwargs)
-
-
 StacIO.set_default(CustomStacIO)
 
 
-class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
-    def __init__(self, conf):
-        super().__init__()
-        self.conf = conf
-        self.domain = "demo.eoepca.org"
-        self.workspace_prefix = "demo-user"
-        self.ades_rx_token = self.conf["auth_env"]["jwt"]
+class EoepcaCalrissianRunnerExecutionHandler(CommonExecutionHandler):
+    """EOEPCA-specific execution handler with Workspace API integration."""
+
+    def __init__(self, conf, outputs):
+        super().__init__(conf, outputs)
+        self.http_proxy_env = os.environ.get("HTTP_PROXY", None)
+        self.username = None
         self.feature_collection = None
 
-    def pre_execution_hook(self):
-        # decode the JWT token to get the user name
-        decoded = jwt.decode(self.ades_rx_token, options={"verify_signature": False})
+        # Get auth environment
+        auth_env = self.conf.get("auth_env", {})
+        self.ades_rx_token = auth_env.get("jwt", "")
 
-        logger.info("Pre execution hook")
+        # Get EOEPCA configuration
+        eoepca = self.conf.get("eoepca", {})
+        self.domain = eoepca.get("domain", "")
+        self.workspace_url = eoepca.get("workspace_url", "")
+        self.workspace_prefix = eoepca.get("workspace_prefix", "")
 
-        # Workspace API endpoint
-        uri_for_request = f"workspaces/{self.workspace_prefix}-{decoded['user_name']}"
+        # Should the user's Workspace bucket be used for stage-out?
+        if self.workspace_url and self.workspace_prefix:
+            self.use_workspace = True
+        else:
+            self.use_workspace = False
 
-        workspace_api_endpoint = os.path.join(
-            f"https://workspace-api.{self.domain}", uri_for_request
+        # Should outputs be registered to the Workspace Catalogue?
+        self.workspace_catalog_register = self.use_workspace and (
+            (eoepca.get("workspace_catalog_register", "false")).lower() == "true"
         )
 
-        # Request: Get Workspace Details
-        headers = {
-            "accept": "application/json",
-            "Authorization": f"Bearer {self.ades_rx_token}",
-        }
-        workspace_response = requests.get(
-            workspace_api_endpoint, headers=headers
-        ).json()
+        # Initialize config defaults
+        self.init_config_defaults(self.conf)
 
-        logger.info("Set user bucket settings")
+    def unset_http_proxy_env(self):
+        """Temporarily unset HTTP_PROXY environment variable."""
+        http_proxy = os.environ.pop("HTTP_PROXY", None)
+        logger.info(f"Unsetting env HTTP_PROXY, whose value was {http_proxy}")
 
-        storage_credentials = workspace_response["storage"]["credentials"]
-
-        self.conf["additional_parameters"] = {
-            "STAGEOUT_AWS_SERVICEURL": storage_credentials.get("endpoint"),
-            "STAGEOUT_AWS_ACCESS_KEY_ID": storage_credentials.get("access"),
-            "STAGEOUT_AWS_SECRET_ACCESS_KEY": storage_credentials.get("secret"),
-            "STAGEOUT_AWS_REGION": storage_credentials.get("region"),
-            "STAGEOUT_OUTPUT": storage_credentials.get("bucketname"),
-            "process": os.path.join("processing-results", self.conf["lenv"]["usid"]),
-            "collection_id": self.conf["lenv"]["usid"],
-        }
-
-    def post_execution_hook(self, log, output, usage_report, tool_logs):
-        logger.info("Post execution hook")
-
-        # decode the JWT token to get the user name
-        decoded = jwt.decode(self.ades_rx_token, options={"verify_signature": False})
-
-        # Workspace API endpoint
-        uri_for_request = f"/workspaces/{self.workspace_prefix}-{decoded['user_name']}"
-        workspace_api_endpoint = f"https://workspace-api.{self.domain}{uri_for_request}"
-
-        # Request: Get Workspace Details
-        headers = {
-            "accept": "application/json",
-            "Authorization": f"Bearer {self.ades_rx_token}",
-        }
-        workspace_response = requests.get(
-            workspace_api_endpoint, headers=headers
-        ).json()
-
-        storage_credentials = workspace_response["storage"]["credentials"]
-
-        logger.info("Set user bucket settings")
-        os.environ["AWS_S3_ENDPOINT"] = storage_credentials.get("endpoint")
-        os.environ["AWS_ACCESS_KEY_ID"] = storage_credentials.get("access")
-        os.environ["AWS_SECRET_ACCESS_KEY"] = storage_credentials.get("secret")
-        os.environ["AWS_REGION"] = storage_credentials.get("region")
-
-        StacIO.set_default(CustomStacIO)
-
-        logger.info(f"STAC Catalog URI: {output['StacCatalogUri']}")
-
-        try:
-            cat = read_file(output["StacCatalogUri"])
-            cat.describe()
-        except Exception as e:
-            logger.error(f"Exception: {e}")
-
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {self.ades_rx_token}",
-        }
-
-        api_endpoint = f"https://workspace-api.{self.domain}/workspaces/{self.workspace_prefix}-{decoded['user_name']}"
-
-        logger.info(
-            f"Register collection in workspace {self.workspace_prefix}-{decoded['user_name']}"
-        )
-        collection = next(cat.get_all_collections())
-
-        logger.info(f"Register collection in the catalog")
-        r = requests.post(
-            f"{api_endpoint}/register-json",
-            json=collection.to_dict(),
-            headers=headers,
-        )
-        logger.info(f"Register collection response: {r.status_code}")
-
-        logger.info(f"Register the collection and associated items to the catalog and to the harvester")
-        r = requests.post(f"{api_endpoint}/register",
-                        json={"type": "stac-item", "url": collection.get_self_href()},
-                        headers=headers,)
-        logger.info(f"Register collection response: {r.status_code}")
-
-        #self.feature_collection = requests.get(
-        #    f"{api_endpoint}/collections/{collection.id}", headers=headers
-        #).json()
+    def restore_http_proxy_env(self):
+        """Restore HTTP_PROXY environment variable if it was set."""
+        if self.http_proxy_env:
+            os.environ["HTTP_PROXY"] = self.http_proxy_env
+            logger.info(f"Restoring env HTTP_PROXY, to value {self.http_proxy_env}")
 
     @staticmethod
-    def local_get_file(fileName):
-        """
-        Read and load the contents of a yaml file
+    def get_user_name(decodedJwt):
+        """Extract username from JWT token. Supports multiple username fields."""
+        for key in ["username", "user_name", "preferred_username"]:
+            if key in decodedJwt:
+                return decodedJwt[key]
+        return None
 
-        :param yaml file to load
-        """
+    @staticmethod
+    def init_config_defaults(conf):
+        """Initialize default configuration parameters for stage-in/stage-out."""
+        if "additional_parameters" not in conf:
+            conf["additional_parameters"] = {}
+
+        # Stage-in defaults
+        conf["additional_parameters"]["STAGEIN_AWS_SERVICEURL"] = os.environ.get(
+            "STAGEIN_AWS_SERVICEURL", "http://s3-service.zoo.svc.cluster.local:9000"
+        )
+        conf["additional_parameters"]["STAGEIN_AWS_ACCESS_KEY_ID"] = os.environ.get(
+            "STAGEIN_AWS_ACCESS_KEY_ID", "minio-admin"
+        )
+        conf["additional_parameters"]["STAGEIN_AWS_SECRET_ACCESS_KEY"] = os.environ.get(
+            "STAGEIN_AWS_SECRET_ACCESS_KEY", "minio-secret-password"
+        )
+        conf["additional_parameters"]["STAGEIN_AWS_REGION"] = os.environ.get(
+            "STAGEIN_AWS_REGION", "RegionOne"
+        )
+
+        # Stage-out defaults
+        conf["additional_parameters"]["STAGEOUT_AWS_SERVICEURL"] = os.environ.get(
+            "STAGEOUT_AWS_SERVICEURL", "http://s3-service.zoo.svc.cluster.local:9000"
+        )
+        conf["additional_parameters"]["STAGEOUT_AWS_ACCESS_KEY_ID"] = os.environ.get(
+            "STAGEOUT_AWS_ACCESS_KEY_ID", "minio-admin"
+        )
+        conf["additional_parameters"]["STAGEOUT_AWS_SECRET_ACCESS_KEY"] = (
+            os.environ.get("STAGEOUT_AWS_SECRET_ACCESS_KEY", "minio-secret-password")
+        )
+        conf["additional_parameters"]["STAGEOUT_AWS_REGION"] = os.environ.get(
+            "STAGEOUT_AWS_REGION", "RegionOne"
+        )
+        conf["additional_parameters"]["STAGEOUT_OUTPUT"] = os.environ.get(
+            "STAGEOUT_OUTPUT", "eoepca"
+        )
+
+    def pre_execution_hook(self):
+        """Hook to run before execution with EOEPCA Workspace integration."""
         try:
-            with open(fileName, "r") as file:
-                data = yaml.safe_load(file)
-            return data
-        # if file does not exist
-        except FileNotFoundError:
-            return {}
-        # if file is empty
-        except yaml.YAMLError:
-            return {}
-        # if file is not yaml
-        except yaml.scanner.ScannerError:
-            return {}
+            logger.info("Pre execution hook")
+            self.unset_http_proxy_env()
 
-    def get_pod_env_vars(self):
-        logger.info("get_pod_env_vars")
+            # Decode JWT token to get username
+            username_source = None
+            if self.ades_rx_token:
+                self.username = self.get_user_name(
+                    jwt.decode(self.ades_rx_token, options={"verify_signature": False})
+                )
+                if self.username:
+                    username_source = "JWT"
 
-        return self.conf.get("pod_env_vars", {})
+            # Fallback: get username from Path-Prefix env var
+            if not self.username:
+                self.username = os.getenv("SERVICES_NAMESPACE")
+                if self.username:
+                    username_source = "Path-Prefix"
 
-    def get_pod_node_selector(self):
-        logger.info("get_pod_node_selector")
+            # Log username outcome
+            if self.username:
+                logger.info(f"Using username {self.username} from {username_source}")
+            else:
+                logger.warning("Unable to determine username")
 
-        return self.conf.get("pod_node_selector", {})
+            # Lookup workspace storage details if configured
+            if self.use_workspace:
+                logger.info("Lookup storage details in Workspace")
 
-    def get_secrets(self):
-        logger.info("get_secrets")
+                uri_for_request = f"workspaces/{self.workspace_prefix}-{self.username}"
+                workspace_api_endpoint = os.path.join(
+                    self.workspace_url, uri_for_request
+                )
+                logger.info(f"Using Workspace API endpoint {workspace_api_endpoint}")
 
-        return self.local_get_file("/assets/pod_imagePullSecrets.yaml")
+                headers = {"accept": "application/json"}
+                if self.ades_rx_token:
+                    headers["Authorization"] = f"Bearer {self.ades_rx_token}"
 
-    def get_additional_parameters(self):
-        logger.info("get_additional_parameters")
+                get_workspace_details_response = requests.get(
+                    workspace_api_endpoint, headers=headers
+                )
 
-        return self.conf.get("additional_parameters", {})
+                # GOOD response from Workspace API - use the details
+                if get_workspace_details_response.ok:
+                    workspace_response = get_workspace_details_response.json()
+                    logger.info("Set user bucket settings")
 
-    def handle_outputs(self, log, output, usage_report, tool_logs):
-        """
-        Handle the output files of the execution.
+                    storage_credentials = workspace_response["storage"]["credentials"]
 
-        :param log: The application log file of the execution.
-        :param output: The output file of the execution.
-        :param usage_report: The metrics file.
-        :param tool_logs: A list of paths to individual workflow step logs.
+                    self.conf["additional_parameters"][
+                        "STAGEOUT_AWS_SERVICEURL"
+                    ] = storage_credentials.get("endpoint")
+                    self.conf["additional_parameters"][
+                        "STAGEOUT_AWS_ACCESS_KEY_ID"
+                    ] = storage_credentials.get("access")
+                    self.conf["additional_parameters"][
+                        "STAGEOUT_AWS_SECRET_ACCESS_KEY"
+                    ] = storage_credentials.get("secret")
+                    self.conf["additional_parameters"][
+                        "STAGEOUT_AWS_REGION"
+                    ] = storage_credentials.get("region")
+                    self.conf["additional_parameters"][
+                        "STAGEOUT_OUTPUT"
+                    ] = storage_credentials.get("bucketname")
+                # BAD response from Workspace API - fallback to pre-configured storage
+                else:
+                    logger.error("Problem connecting with the Workspace API")
+                    logger.info(
+                        f"  Response code = {get_workspace_details_response.status_code}"
+                    )
+                    logger.info(
+                        f"  Response text = \n{get_workspace_details_response.text}"
+                    )
+                    self.use_workspace = False
+                    logger.info("Using pre-configured storage details")
+            else:
+                logger.info("Using pre-configured storage details")
 
-        """
+            lenv = self.conf.get("lenv", {})
+            self.conf["additional_parameters"]["collection_id"] = lenv.get("usid", "")
+            self.conf["additional_parameters"]["process"] = os.path.join(
+                "processing-results",
+                self.conf["additional_parameters"]["collection_id"],
+            )
 
-        logger.info("handle_outputs")
+        except Exception as e:
+            logger.error("ERROR in pre_execution_hook...")
+            logger.error(traceback.format_exc())
+            raise (e)
 
-        # link element to add to the statusInfo
-        servicesLogs = [
-            {
-                "url": f"{self.conf['main']['tmpUrl']}/"
-                f"{self.conf['lenv']['Identifier']}-{self.conf['lenv']['usid']}/"
-                f"{os.path.basename(tool_log)}",
-                "title": f"Tool log {os.path.basename(tool_log)}",
-                "rel": "related",
-            }
-            for tool_log in tool_logs
-        ]
-        for i in range(len(servicesLogs)):
-            okeys = ["url", "title", "rel"]
-            keys = ["url", "title", "rel"]
-            if i > 0:
-                for j in range(len(keys)):
-                    keys[j] = keys[j] + "_" + str(i)
-            if "service_logs" not in self.conf:
-                self.conf["service_logs"] = {}
-            for j in range(len(keys)):
-                self.conf["service_logs"][keys[j]] = servicesLogs[i][okeys[j]]
+        finally:
+            self.restore_http_proxy_env()
 
-        self.conf["service_logs"]["length"] = str(len(servicesLogs))
+    def post_execution_hook(self, log, output, usage_report, tool_logs):
+        """Hook to run after execution with EOEPCA STAC catalog registration."""
+        try:
+            logger.info("Post execution hook")
+            self.unset_http_proxy_env()
+
+            logger.info("Set user bucket settings")
+            os.environ["AWS_S3_ENDPOINT"] = self.conf["additional_parameters"][
+                "STAGEOUT_AWS_SERVICEURL"
+            ]
+            os.environ["AWS_ACCESS_KEY_ID"] = self.conf["additional_parameters"][
+                "STAGEOUT_AWS_ACCESS_KEY_ID"
+            ]
+            os.environ["AWS_SECRET_ACCESS_KEY"] = self.conf["additional_parameters"][
+                "STAGEOUT_AWS_SECRET_ACCESS_KEY"
+            ]
+            os.environ["AWS_REGION"] = self.conf["additional_parameters"][
+                "STAGEOUT_AWS_REGION"
+            ]
+
+            StacIO.set_default(CustomStacIO)
+
+            for i in self.outputs:
+                logger.info(f"Output {i}: {self.outputs[i]}")
+                if "mimeType" in self.outputs[i]:
+                    self.setOutput(i, output)
+                else:
+                    logger.warning(f"Output {i} has no mimeType, skipping...")
+                    self.outputs[i]["value"] = str(output[i])
+
+        except Exception as e:
+            logger.error("ERROR in post_execution_hook...")
+            logger.error(traceback.format_exc())
+            raise (e)
+
+        finally:
+            self.restore_http_proxy_env()
+
+    def setOutput(self, outputName, values):
+        """Process and set output values from STAC catalog with EOEPCA registration."""
+        output = self.outputs[outputName]
+        logger.info(f"Read catalog from STAC Catalog URI: {output} -> {values}")
+
+        if not isinstance(values[outputName], list):
+            logger.info(
+                f"values[{outputName}] is not a list, transform to an array"
+            )
+            values[outputName] = [values[outputName]]
+
+        items = []
+
+        for i in range(len(values[outputName])):
+            if values[outputName][i] is None:
+                break
+            s3_path = values[outputName][i]["value"]
+            try:
+                if s3_path.count("s3://") == 0:
+                    s3_path = "s3://" + s3_path
+                cat: Catalog = read_file(s3_path)
+            except Exception as e:
+                logger.error(f"No collection found in the output catalog {e}")
+                output["collection"] = json.dumps({}, indent=2)
+                return
+
+            collection_id = self.conf["additional_parameters"]["collection_id"]
+            logger.info(f"Create collection with ID {collection_id}")
+
+            collection = None
+
+            try:
+                logger.info(f"Catalog : {dir(cat)}")
+                collection: Collection = next(cat.get_all_collections())
+            except Exception as e:
+                try:
+                    items_from_cat = cat.get_all_items()
+                    itemFinal = []
+                    for item in items_from_cat:
+                        for a in item.assets.keys():
+                            cDict = item.assets[a].to_dict()
+                            cDict["storage:platform"] = "EOEPCA"
+                            cDict["storage:requester_pays"] = False
+                            cDict["storage:tier"] = "Standard"
+                            cDict["storage:region"] = self.conf[
+                                "additional_parameters"
+                            ]["STAGEOUT_AWS_REGION"]
+                            cDict["storage:endpoint"] = self.conf[
+                                "additional_parameters"
+                            ]["STAGEOUT_AWS_SERVICEURL"]
+                            item.assets[a] = item.assets[a].from_dict(cDict)
+                        item.collection_id = collection_id
+                        itemFinal += [item.clone()]
+                        items.append(item.clone())
+                    collection = ItemCollection(items=itemFinal)
+                    logger.info("Created collection from items")
+                except Exception as e:
+                    logger.error(
+                        f"No collection or item found in the output catalog {e}"
+                    )
+
+        # Trap the case of no output collection
+        if collection is None:
+            logger.error("ABORT: The output collection is empty")
+            output["collection"] = json.dumps({}, indent=2)
+            return
+
+        if len(items) > 0:
+            collection = ItemCollection(items=itemFinal)
+        collection_dict = collection.to_dict()
+        collection_dict["id"] = collection_id
+        output["collection"] = collection_dict
+        output["collection"]["id"] = collection_id
+
+        # Register with the workspace catalogue if configured
+        if self.workspace_catalog_register:
+            logger.info(
+                f"Register collection in workspace {self.workspace_prefix}-{self.username}"
+            )
+            headers = {"Accept": "application/json"}
+            if self.ades_rx_token:
+                headers["Authorization"] = f"Bearer {self.ades_rx_token}"
+            api_endpoint = f"{self.workspace_url}/workspaces/{self.workspace_prefix}-{self.username}"
+            r = requests.post(
+                f"{api_endpoint}/register-json",
+                json=collection_dict,
+                headers=headers,
+            )
+            logger.info(f"Register collection response: {r.status_code}")
+
+            logger.info(f"Register processing results to collection")
+            r = requests.post(
+                f"{api_endpoint}/register",
+                json={"type": "stac-item", "url": collection.get_self_href()},
+                headers=headers,
+            )
+            logger.info(f"Register processing results response: {r.status_code}")
 
 
 def water_bodies(conf, inputs, outputs): # noqa
 
-    with open(
-        os.path.join(
-            pathlib.Path(os.path.realpath(__file__)).parent.absolute(),
-            "app-package.cwl",
-        ),
-        "r",
-    ) as stream:
-        cwl = yaml.safe_load(stream)
+    try:
+        with open(
+            os.path.join(
+                pathlib.Path(os.path.realpath(__file__)).parent.absolute(),
+                "app-package.cwl",
+            ),
+            "r",
+        ) as stream:
+            cwl = yaml.safe_load(stream)
 
-    execution_handler = EoepcaCalrissianRunnerExecutionHandler(conf=conf)
+        execution_handler = EoepcaCalrissianRunnerExecutionHandler(conf=conf, outputs=outputs)
 
-    runner = ZooCalrissianRunner(
+        runner = ZooCalrissianRunner(
         cwl=cwl,
         conf=conf,
         inputs=inputs,
