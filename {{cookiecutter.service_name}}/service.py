@@ -7,7 +7,7 @@ try:
     import zoo
 except ImportError:
     # Use centralized ZooStub from zoo-runner-common package
-    from zoostub import ZooStub
+    from zoo_runner_common.zoostub import ZooStub
     zoo = ZooStub()
 
 import json
