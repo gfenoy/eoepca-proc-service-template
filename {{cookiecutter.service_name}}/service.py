@@ -21,8 +21,8 @@ from loguru import logger
 from pystac import Catalog, Collection, read_file
 from pystac.item_collection import ItemCollection
 from pystac.stac_io import StacIO
-from zoo_calrissian_runner import ZooCalrissianRunner
-from zoo_template_common import CommonExecutionHandler, CustomStacIO
+from zoo_calrissian_runner import ZooCalrissianRunner, ExecutionHandler
+from zoo_template_common import CustomStacIO
 
 # For DEBUG
 import traceback
@@ -33,7 +33,7 @@ logger.add(sys.stderr, level="INFO")
 StacIO.set_default(CustomStacIO)
 
 
-class EoepcaCalrissianRunnerExecutionHandler(CommonExecutionHandler):
+class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
     """EOEPCA-specific execution handler with Workspace API integration."""
 
     def __init__(self, conf, outputs):
