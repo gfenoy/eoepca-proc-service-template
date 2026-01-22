@@ -37,7 +37,7 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
     """EOEPCA-specific execution handler with Workspace API integration."""
 
     def __init__(self, conf, outputs):
-        super().__init__(conf, outputs)
+        super().__init__(conf=conf, outputs=outputs)
         self.http_proxy_env = os.environ.get("HTTP_PROXY", None)
         self.username = None
         self.feature_collection = None
