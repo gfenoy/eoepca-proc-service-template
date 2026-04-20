@@ -18,11 +18,13 @@ import jwt
 import requests
 import yaml
 from loguru import logger
-from pystac import Catalog, Collection, read_file
+from pystac import Catalog, Collection, Item, Asset, read_file
 from pystac.item_collection import ItemCollection
 from pystac.stac_io import StacIO
 from zoo_calrissian_runner import ZooCalrissianRunner, ExecutionHandler
 from zoo_template_common import CustomStacIO
+import mimetypes
+from datetime import datetime, timezone
 
 # For DEBUG
 import traceback
@@ -262,28 +264,52 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
         logger.info(f"Read catalog from STAC Catalog URI: {output} -> {values}")
 
         if not isinstance(values[outputName], list):
-            logger.info(
-                f"values[{outputName}] is not a list, transform to an array"
-            )
+            logger.info(f"values[{outputName}] is not a list, transform to an array")
             values[outputName] = [values[outputName]]
 
         items = []
+        collection_id = self.get_additional_parameters()["sub_path"]
+        logger.info(f"Create collection with ID {collection_id}")
 
         for i in range(len(values[outputName])):
             if values[outputName][i] is None:
                 break
-            s3_path = values[outputName][i]["value"]
-            try:
-                if s3_path.count("s3://") == 0:
-                    s3_path = "s3://" + s3_path
-                cat: Catalog = read_file(s3_path)
-            except Exception as e:
-                logger.error(f"No collection found in the output catalog {e}")
-                output["collection"] = json.dumps({}, indent=2)
-                return
-
-            collection_id = self.conf["additional_parameters"]["collection_id"]
-            logger.info(f"Create collection with ID {collection_id}")
+            value_uri = str(values[outputName][i]["value"]).strip()
+            logger.info(f"setOutput: reading STAC catalog from '{value_uri}'")
+            # If the URI is not a JSON file (e.g. raw staged file like .png, .parquet),
+            # try to find catalog.json at the canonical path, or create a minimal item.
+            if not value_uri.endswith(".json"):
+                logger.warning(
+                    f"Output '{outputName}' value '{value_uri}' is not a STAC catalog JSON. "
+                    f"Creating a minimal STAC item directly."
+                )
+                basename = os.path.basename(str(value_uri).rstrip("/"))
+                mime_type, _ = mimetypes.guess_type(basename)
+                if mime_type is None:
+                    mime_type = "application/octet-stream"
+                item = Item(
+                    id=outputName,
+                    geometry=None,
+                    bbox=None,
+                    datetime=datetime.now(tz=timezone.utc),
+                    properties={},
+                )
+                item.add_asset("data", Asset(
+                    href=str(value_uri),
+                    media_type=mime_type,
+                    roles=["data"],
+                    extra_fields={
+                        "storage:platform": "EOEPCA",
+                        "storage:requester_pays": False,
+                        "storage:tier": "Standard",
+                        "storage:region": self.conf["additional_parameters"]["STAGEOUT_AWS_REGION"],
+                        "storage:endpoint": self.conf["additional_parameters"]["STAGEOUT_AWS_SERVICEURL"]
+                    }
+                ))
+                item.collection_id = collection_id
+                items.append(item)
+                continue
+            cat: Catalog = read_file(value_uri)
 
             collection = None
 
@@ -291,43 +317,46 @@ class EoepcaCalrissianRunnerExecutionHandler(ExecutionHandler):
                 logger.info(f"Catalog : {dir(cat)}")
                 collection: Collection = next(cat.get_all_collections())
             except Exception as e:
-                try:
-                    items_from_cat = cat.get_all_items()
-                    itemFinal = []
-                    for item in items_from_cat:
-                        for a in item.assets.keys():
-                            cDict = item.assets[a].to_dict()
-                            cDict["storage:platform"] = "EOEPCA"
-                            cDict["storage:requester_pays"] = False
-                            cDict["storage:tier"] = "Standard"
-                            cDict["storage:region"] = self.conf[
-                                "additional_parameters"
-                            ]["STAGEOUT_AWS_REGION"]
-                            cDict["storage:endpoint"] = self.conf[
-                                "additional_parameters"
-                            ]["STAGEOUT_AWS_SERVICEURL"]
-                            item.assets[a] = item.assets[a].from_dict(cDict)
-                        item.collection_id = collection_id
-                        itemFinal += [item.clone()]
-                        items.append(item.clone())
-                    collection = ItemCollection(items=itemFinal)
-                    logger.info("Created collection from items")
-                except Exception as e:
-                    logger.error(
-                        f"No collection or item found in the output catalog {e}"
+                logger.error("No collection found in the output catalog")
+                output["collection"] = json.dumps({}, indent=2)
+                return
+
+            logger.info(f"Got collection {collection.id} from processing outputs")
+
+            for item in collection.get_all_items():
+                logger.info(f"Processing item {item.id}")
+
+                for asset_key in item.assets.keys():
+                    logger.info(f"Processing asset {asset_key}")
+
+                    temp_asset = item.assets[asset_key].to_dict()
+                    temp_asset["storage:platform"] = "EOEPCA"
+                    temp_asset["storage:requester_pays"] = False
+                    temp_asset["storage:tier"] = "Standard"
+                    temp_asset["storage:region"] = self.conf[
+                        "additional_parameters"
+                    ]["STAGEOUT_AWS_REGION"]
+                    temp_asset["storage:endpoint"] = self.conf[
+                        "additional_parameters"
+                    ]["STAGEOUT_AWS_SERVICEURL"]
+                    item.assets[asset_key] = item.assets[asset_key].from_dict(
+                        temp_asset
                     )
 
+                item.collection_id = collection_id
+                items.append(item.clone())
+
+        item_collection = ItemCollection(items=items)
+        logger.info("Created feature collection from items")
+
         # Trap the case of no output collection
-        if collection is None:
-            logger.error("ABORT: The output collection is empty")
+        if item_collection is None:
+            logger.error("The output collection is empty")
             output["collection"] = json.dumps({}, indent=2)
             return
 
-        if len(items) > 0:
-            collection = ItemCollection(items=itemFinal)
-        collection_dict = collection.to_dict()
-        collection_dict["id"] = collection_id
-        output["collection"] = collection_dict
+        # Set the feature collection to be returned
+        output["collection"] = item_collection.to_dict()
         output["collection"]["id"] = collection_id
 
         # Register with the workspace catalogue if configured
